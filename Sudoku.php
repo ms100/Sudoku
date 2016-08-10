@@ -2,7 +2,7 @@
 error_reporting(-1);
 declare(ticks = 1);
 
-class Shudu{
+class Sudoku{
     protected $parent_pid = 0;
     protected $pid = 0;
     protected $children = array();
