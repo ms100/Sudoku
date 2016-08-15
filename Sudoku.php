@@ -12,11 +12,33 @@ class Sudoku{
     protected $columns = array();
     protected $blocks = array();
 
+    protected $fifo_path = '';
+    protected $fifo_fp;
+    protected $fifo_data = '';
+
 
     public function __construct($matrix){
+        if(!function_exists('posix_kill')){
+            echo 'The function posix_kill was not found. Please ensure POSIX functions are installed' . PHP_EOL;
+            exit;
+        }
+
+        if(!function_exists('pcntl_fork')){
+            echo 'The function pcntl_fork was not found. Please ensure Process Control functions are installed' . PHP_EOL;
+            exit;
+        }
+
         $this->register_ticks();
 
         $this->pid = $this->parent_pid = getmypid();
+
+        $this->fifo_path = 'sudoku_' . getmypid();
+
+        if(!posix_mkfifo($this->fifo_path, 0666)){
+            exit;
+        }
+        $this->fifo_fp = fopen($this->fifo_path, 'w+');
+        stream_set_blocking($this->fifo_fp, false);
 
         $temp = explode("\n", $matrix);
         foreach($temp as $value){
@@ -35,10 +57,31 @@ class Sudoku{
         }
     }
 
+    public function compute(){
+        $pid = pcntl_fork();
+        switch($pid){
+            case 0:
+                //echo getmypid() . "启动\n";
+                fwrite($this->fifo_fp, getmypid() . "启动\n");
+                $this->parent_pid = $this->pid;
+                $this->pid = getmypid();
+                $this->children = array();
+                $this->run();
+                exit;
+                break;
+            case -1:
+                echo "fork failed\n";
+                exit;
+            default:
+                $this->children[$pid] = "the process master run";
+                $this->process_loop();
+        }
+    }
+
     /**
      * 计算数独
      */
-    public function run(){
+    protected function run(){
         //开始处理
         $this->dispose();
 
@@ -68,6 +111,7 @@ class Sudoku{
                             continue 2;
                         case 0:
                             //echo getmypid() . "空无数字可填\n";
+                            fwrite($this->fifo_fp, getmypid() . "空无数字可填\n");
                             exit;
                         default:
                             $n = $tmp;
@@ -93,6 +137,7 @@ class Sudoku{
                         continue 2;
                     default:
                         //echo getmypid() . "值比空多\n";
+                        fwrite($this->fifo_fp, getmypid() . "值比空多\n");
                         exit;
 
                 }
@@ -121,6 +166,7 @@ class Sudoku{
 
         if(!isset($choice)){
             //echo getmypid() . "出错了\n";
+            fwrite($this->fifo_fp, getmypid() . "出错了\n");
             exit;
         }
         $maybe = $this->all_nums[$choice];
@@ -130,16 +176,17 @@ class Sudoku{
             switch($pid){
                 case 0:
                     //echo getmypid() . "启动\n";
+                    fwrite($this->fifo_fp, getmypid() . "启动\n");
                     $this->parent_pid = $this->pid;
                     $this->pid = getmypid();
                     $this->children = array();
                     $this->all_nums[$choice] = $value;
                     $this->run();
-                    //echo getmypid() . "run 完了\n";
                     exit;
                     break;
                 case -1:
-                    echo "fork failed\n";
+                    //echo "fork failed\n";
+                    fwrite($this->fifo_fp, getmypid() . "fork failed\n");
                     posix_kill($this->parent_pid, SIGUSR1);
                     break 2;
                 default:
@@ -179,6 +226,7 @@ class Sudoku{
             return false;
         }elseif(count($same_key) > count($arr[$index])){
             //echo getmypid() . "空比值多\n";
+            fwrite($this->fifo_fp, getmypid() . "空比值多\n");
             exit;
         }
 
@@ -210,6 +258,7 @@ class Sudoku{
         foreach($this->all_nums as $v){
             if(empty($v)){
                 //echo getmypid() . "空无数字可填\n";
+                fwrite($this->fifo_fp, getmypid() . "空无数字可填\n");
                 exit;
             }elseif(!is_int($v)){
                 $return = 0;
@@ -224,6 +273,7 @@ class Sudoku{
             foreach($m as $n){
                 if(count(array_unique($n)) != count($n)){
                     //echo getmypid() . "有数字填重复了\n";
+                    fwrite($this->fifo_fp, getmypid() . "有数字填重复了\n");
                     exit;
                 }
             }
@@ -231,6 +281,7 @@ class Sudoku{
 
         //完成了打印出来，并通知父进程成功了
         $this->output($this->all_nums);
+        fwrite($this->fifo_fp, getmypid() . "成功，退出\n");
         posix_kill($this->parent_pid, SIGUSR2);
         exit;
     }
@@ -239,18 +290,21 @@ class Sudoku{
      * 输出
      */
     protected function output(){
+        $str = '';
         for($i = 0; $i < 81; $i++){
             if(is_array($this->all_nums[$i])){
-                echo json_encode($this->all_nums[$i]);
+                $str .= json_encode($this->all_nums[$i]);
             }else{
-                echo $this->all_nums[$i];
+                $str .= $this->all_nums[$i];
             }
             if($i % 9 == 8){
-                echo "\n";
+                $str .= "\n";
             }else{
-                echo ',';
+                $str .= ',';
             }
         }
+
+        fwrite($this->fifo_fp, $str);
     }
 
     /**
@@ -318,16 +372,36 @@ class Sudoku{
      * 等待
      */
     protected function process_loop(){
+
+
         while(count($this->children)){
+            if($this->parent_pid == getmypid()){
+                do{
+                    $data = fread($this->fifo_fp, 4096);
+                    $this->fifo_data .= $data;
+                }while(strlen($data) >= 4096);
+            }
+
+
             //echo getmypid() . print_r($this->children, true);
             $pid = pcntl_wait($status, WNOHANG);
             if($pid && isset($this->children[$pid])){
                 //echo $pid . "退出\n";
+                //fwrite($this->fifo_fp, $pid . "退出\n");
                 unset($this->children[$pid]);
             }
+
             usleep(50000);
         }
+
         //echo getmypid() . "结束\n";
+        fwrite($this->fifo_fp, getmypid() . "结束\n");
+
+        if($this->parent_pid == getmypid()){
+            fclose($this->fifo_fp);
+            unlink($this->fifo_path);
+            echo $this->fifo_data;
+        }
         exit;
     }
 }
